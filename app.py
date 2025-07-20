@@ -1,50 +1,59 @@
 import os
+import sqlite3
 import datetime
-import gspread
-from google.oauth2.service_account import Credentials
-from flask import Flask, render_template, request, jsonify
-import json
+import psycopg2 # PostgreSQLに接続するためのライブラリ
+from flask import Flask, render_template, request, jsonify, g
 
 # --- Flaskアプリケーションの初期化 ---
 app = Flask(__name__)
 
-# --- Google Sheets APIとの連携設定 ---
+# --- データベース関連の関数 ---
 
-def get_spreadsheet_client():
-    """Google Sheetsに接続するためのクライアントを取得する"""
-    # Renderの環境変数から認証情報を読み込む
-    creds_json_str = os.environ.get('GOOGLE_CREDENTIALS_JSON')
-    
-    if creds_json_str:
-        # Render環境の場合：環境変数から認証情報を読み込む
-        creds_dict = json.loads(creds_json_str)
-        creds = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
-        )
-    else:
-        # ローカル環境の場合：ファイルから認証情報を読み込む
-        # このファイルは .gitignore されている必要があります
-        creds = Credentials.from_service_account_file(
-            'credentials.json',
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
-        )
-    
-    client = gspread.authorize(creds)
-    return client
+def get_db():
+    """
+    リクエストごとにデータベース接続を管理する。
+    Render環境ではPostgreSQLに、ローカル環境ではSQLiteに接続する。
+    """
+    if 'db' not in g:
+        # Renderが提供するデータベースURL（環境変数）を取得
+        db_url = os.environ.get('DATABASE_URL')
+        if db_url:
+            # Render環境の場合: PostgreSQLに接続
+            g.db = psycopg2.connect(db_url)
+        else:
+            # ローカル環境の場合: SQLiteに接続
+            app.config['DATABASE'] = 'highscore.db'
+            g.db = sqlite3.connect(
+                app.config['DATABASE'],
+                detect_types=sqlite3.PARSE_DECLTYPES
+            )
+            g.db.row_factory = sqlite3.Row
+    return g.db
 
-# スプレッドシートとワークシートの名前
-SPREADSHEET_NAME = 'ハイスコア'
-WORKSHEET_NAME = 'Sheet1' # 通常はデフォルトのシート名
+@app.teardown_appcontext
+def close_db(e=None):
+    """リクエストの終了時にデータベース接続を閉じる"""
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
 
-def ensure_sheet_header(sheet):
-    """シートのヘッダーを確認し、なければ作成する"""
-    header = sheet.row_values(1)
-    if header != ['タイムスタンプ', '合計点', 'タイム(秒)']:
-        # ヘッダーが正しくない、または空の場合
-        sheet.update('A1:C1', [['タイムスタンプ', '合計点', 'タイム(秒)']])
-        print("スプレッドシートのヘッダーを作成/修正しました。")
-
+def init_db():
+    """データベースのテーブルを初期化（作成）する"""
+    db = get_db()
+    cursor = db.cursor()
+    # PostgreSQLとSQLiteの両方で動作するスキーマ
+    # id SERIAL PRIMARY KEY はPostgreSQLの自動インクリメント
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS scores (
+      id SERIAL PRIMARY KEY,
+      timestamp TEXT NOT NULL,
+      score INTEGER NOT NULL,
+      time INTEGER NOT NULL
+    );
+    """)
+    db.commit()
+    cursor.close()
+    print("データベースのテーブルをチェック・初期化しました。")
 
 # --- ルート（URLと処理の紐付け） ---
 
@@ -57,25 +66,15 @@ def index():
 def get_high_scores():
     """ハイスコアのリストを取得するAPI"""
     try:
-        client = get_spreadsheet_client()
-        sheet = client.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
-        ensure_sheet_header(sheet)
-        
-        records = sheet.get_all_records()
-        
-        # scoreとtimeを数値に変換
-        for record in records:
-            record['合計点'] = int(record['合計点'])
-            record['タイム(秒)'] = int(record['タイム(秒)'])
-
-        sorted_scores = sorted(records, key=lambda x: (-x['合計点'], x['タイム(秒)']))
-        
-        response_data = [{'score': r['合計点'], 'time': r['タイム(秒)']} for r in sorted_scores]
-
-        return jsonify(response_data[:5])
-    except gspread.exceptions.SpreadsheetNotFound:
-        print(f"スプレッドシート '{SPREADSHEET_NAME}' が見つかりません。")
-        return jsonify({"error": "Spreadsheet not found"}), 500
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute(
+            'SELECT score, time FROM scores ORDER BY score DESC, time ASC LIMIT 5'
+        )
+        # fetchall()の結果を辞書に変換
+        scores = [dict(zip([column[0] for column in cursor.description], row)) for row in cursor.fetchall()]
+        cursor.close()
+        return jsonify(scores)
     except Exception as e:
         print(f"スコアの取得中にエラーが発生しました: {e}")
         return jsonify({"error": "Failed to retrieve scores"}), 500
@@ -89,26 +88,29 @@ def save_score():
         return jsonify({"error": "無効なデータです"}), 400
 
     try:
-        client = get_spreadsheet_client()
-        sheet = client.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
-        ensure_sheet_header(sheet) # 保存時にもヘッダーを確認
-        
-        new_row = [
-            datetime.datetime.now().isoformat(),
-            data['score'],
-            data['time']
-        ]
-        
-        sheet.append_row(new_row)
-        
+        score = data['score']
+        time = data['time']
+        timestamp = datetime.datetime.now().isoformat()
+
+        db = get_db()
+        cursor = db.cursor()
+        # PostgreSQLではプレースホルダが %s
+        cursor.execute(
+            'INSERT INTO scores (timestamp, score, time) VALUES (%s, %s, %s)',
+            (timestamp, score, time)
+        )
+        db.commit()
+        cursor.close()
         return jsonify({"status": "success"})
     except Exception as e:
         print(f"スコアの保存中にエラーが発生しました: {e}")
         return jsonify({"error": "Failed to save score"}), 500
 
+# --- アプリケーションの初期化処理 ---
+# このコードはGunicornでアプリが起動した時に一度だけ実行される
+with app.app_context():
+    init_db()
+
 # --- ローカル開発用の設定 ---
 if __name__ == '__main__':
-    # credentials.jsonの存在チェック
-    if not os.path.exists('credentials.json'):
-        print("警告: credentials.json が見つかりません。ローカルでの実行にはこのファイルが必要です。")
     app.run(debug=True)
