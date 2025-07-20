@@ -24,6 +24,7 @@ def get_spreadsheet_client():
         )
     else:
         # ローカル環境の場合：ファイルから認証情報を読み込む
+        # このファイルは .gitignore されている必要があります
         creds = Credentials.from_service_account_file(
             'credentials.json',
             scopes=['https://www.googleapis.com/auth/spreadsheets']
@@ -35,6 +36,15 @@ def get_spreadsheet_client():
 # スプレッドシートとワークシートの名前
 SPREADSHEET_NAME = 'ハイスコア'
 WORKSHEET_NAME = 'Sheet1' # 通常はデフォルトのシート名
+
+def ensure_sheet_header(sheet):
+    """シートのヘッダーを確認し、なければ作成する"""
+    header = sheet.row_values(1)
+    if header != ['タイムスタンプ', '合計点', 'タイム(秒)']:
+        # ヘッダーが正しくない、または空の場合
+        sheet.update('A1:C1', [['タイムスタンプ', '合計点', 'タイム(秒)']])
+        print("スプレッドシートのヘッダーを作成/修正しました。")
+
 
 # --- ルート（URLと処理の紐付け） ---
 
@@ -49,8 +59,8 @@ def get_high_scores():
     try:
         client = get_spreadsheet_client()
         sheet = client.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
+        ensure_sheet_header(sheet)
         
-        # ヘッダーを除いたすべてのレコードを取得 (2行目から)
         records = sheet.get_all_records()
         
         # scoreとtimeを数値に変換
@@ -58,13 +68,11 @@ def get_high_scores():
             record['合計点'] = int(record['合計点'])
             record['タイム(秒)'] = int(record['タイム(秒)'])
 
-        # スコア（降順）、タイム（昇順）で並び替え
         sorted_scores = sorted(records, key=lambda x: (-x['合計点'], x['タイム(秒)']))
         
-        # フロントエンドが期待するキー名に変換
         response_data = [{'score': r['合計点'], 'time': r['タイム(秒)']} for r in sorted_scores]
 
-        return jsonify(response_data[:5]) # 上位5件を返す
+        return jsonify(response_data[:5])
     except gspread.exceptions.SpreadsheetNotFound:
         print(f"スプレッドシート '{SPREADSHEET_NAME}' が見つかりません。")
         return jsonify({"error": "Spreadsheet not found"}), 500
@@ -83,8 +91,8 @@ def save_score():
     try:
         client = get_spreadsheet_client()
         sheet = client.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
+        ensure_sheet_header(sheet) # 保存時にもヘッダーを確認
         
-        # 新しい行として追加するデータ
         new_row = [
             datetime.datetime.now().isoformat(),
             data['score'],
@@ -100,4 +108,7 @@ def save_score():
 
 # --- ローカル開発用の設定 ---
 if __name__ == '__main__':
+    # credentials.jsonの存在チェック
+    if not os.path.exists('credentials.json'):
+        print("警告: credentials.json が見つかりません。ローカルでの実行にはこのファイルが必要です。")
     app.run(debug=True)
