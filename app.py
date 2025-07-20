@@ -1,29 +1,32 @@
+import os
 import sqlite3
 import datetime
-import os
+import psycopg2 # PostgreSQLに接続するためのライブラリ
 from flask import Flask, render_template, request, jsonify, g
 
 # --- Flaskアプリケーションの初期化 ---
 app = Flask(__name__)
-# データベースファイル名を指定
-DATABASE = 'highscore.db'
-app.config['DATABASE'] = DATABASE
-
 
 # --- データベース関連の関数 ---
 
 def get_db():
     """
-    現在のリクエストでデータベース接続がなければ作成し、あれば既存のものを返す。
-    Flaskのgオブジェクトを使い、リクエスト内で接続を再利用する。
+    リクエストごとにデータベース接続を管理する。
+    Render環境ではPostgreSQLに、ローカル環境ではSQLiteに接続する。
     """
     if 'db' not in g:
-        g.db = sqlite3.connect(
-            app.config['DATABASE'],
-            detect_types=sqlite3.PARSE_DECLTYPES
-        )
-        # カラム名でアクセスできるようにする
-        g.db.row_factory = sqlite3.Row
+        # Renderが提供するデータベースURL（環境変数）を取得
+        db_url = os.environ.get('DATABASE_URL')
+        if db_url:
+            # Render環境の場合: PostgreSQLに接続
+            g.db = psycopg2.connect(db_url)
+        else:
+            # ローカル環境の場合: SQLiteに接続
+            g.db = sqlite3.connect(
+                'highscore.db',
+                detect_types=sqlite3.PARSE_DECLTYPES
+            )
+            g.db.row_factory = sqlite3.Row
     return g.db
 
 @app.teardown_appcontext
@@ -36,22 +39,23 @@ def close_db(e=None):
 def init_db():
     """データベースのテーブルを初期化（作成）する"""
     db = get_db()
-    # 外部ファイルに頼らず、直接スキーマを記述する
-    schema = """
+    cursor = db.cursor()
+    # PostgreSQLとSQLiteの両方で動作するスキーマ
+    cursor.execute("""
     CREATE TABLE IF NOT EXISTS scores (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       timestamp TEXT NOT NULL,
       score INTEGER NOT NULL,
       time INTEGER NOT NULL
     );
-    """
-    db.executescript(schema)
+    """)
+    db.commit()
+    cursor.close()
     print("データベースを初期化しました。")
 
-# Flaskのコマンドラインから `flask init-db` でDBを初期化できるようにする
 @app.cli.command('init-db')
 def init_db_command():
-    """データベーステーブルをクリアして作成します。"""
+    """データベーステーブルを作成します。"""
     with app.app_context():
         init_db()
     print('データベースを初期化しました。')
@@ -69,13 +73,14 @@ def get_high_scores():
     """ハイスコアのリストを取得するAPI"""
     try:
         db = get_db()
-        # スコアの降順、タイムの昇順で上位5件を取得するように変更
-        scores_cursor = db.execute(
+        cursor = db.cursor()
+        cursor.execute(
             'SELECT score, time FROM scores ORDER BY score DESC, time ASC LIMIT 5'
         )
-        scores = scores_cursor.fetchall()
-        # 取得したデータをJSON形式で返す
-        return jsonify([dict(row) for row in scores])
+        # fetchall()の結果を辞書に変換
+        scores = [dict(zip([column[0] for column in cursor.description], row)) for row in cursor.fetchall()]
+        cursor.close()
+        return jsonify(scores)
     except Exception as e:
         print(f"スコアの取得中にエラーが発生しました: {e}")
         return jsonify({"error": "Failed to retrieve scores"}), 500
@@ -94,23 +99,22 @@ def save_score():
         timestamp = datetime.datetime.now().isoformat()
 
         db = get_db()
-        db.execute(
-            'INSERT INTO scores (timestamp, score, time) VALUES (?, ?, ?)',
+        cursor = db.cursor()
+        cursor.execute(
+            'INSERT INTO scores (timestamp, score, time) VALUES (%s, %s, %s)',
             (timestamp, score, time)
         )
-        db.commit() # 変更を確定
+        db.commit()
+        cursor.close()
         return jsonify({"status": "success"})
     except Exception as e:
         print(f"スコアの保存中にエラーが発生しました: {e}")
         return jsonify({"error": "Failed to save score"}), 500
 
-# --- アプリケーションの実行 ---
+# --- ローカル開発用の設定 ---
 if __name__ == '__main__':
-    # アプリケーションコンテキスト内でデータベースの存在を確認し、なければ初期化
     with app.app_context():
-        if not os.path.exists(DATABASE):
-            print(f"'{DATABASE}'が見つからないため、新規に作成します。")
+        if not os.path.exists('highscore.db'):
+            print("'highscore.db'が見つからないため、新規に作成します。")
             init_db()
-    
-    # Flaskの開発サーバーを起動
     app.run(debug=True)
