@@ -22,8 +22,9 @@ def get_db():
             g.db = psycopg2.connect(db_url)
         else:
             # ローカル環境の場合: SQLiteに接続
+            app.config['DATABASE'] = 'highscore.db'
             g.db = sqlite3.connect(
-                'highscore.db',
+                app.config['DATABASE'],
                 detect_types=sqlite3.PARSE_DECLTYPES
             )
             g.db.row_factory = sqlite3.Row
@@ -41,6 +42,7 @@ def init_db():
     db = get_db()
     cursor = db.cursor()
     # PostgreSQLとSQLiteの両方で動作するスキーマ
+    # id SERIAL PRIMARY KEY はPostgreSQLの自動インクリメント
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS scores (
       id SERIAL PRIMARY KEY,
@@ -51,15 +53,7 @@ def init_db():
     """)
     db.commit()
     cursor.close()
-    print("データベースを初期化しました。")
-
-@app.cli.command('init-db')
-def init_db_command():
-    """データベーステーブルを作成します。"""
-    with app.app_context():
-        init_db()
-    print('データベースを初期化しました。')
-
+    print("データベースのテーブルをチェック・初期化しました。")
 
 # --- ルート（URLと処理の紐付け） ---
 
@@ -100,6 +94,7 @@ def save_score():
 
         db = get_db()
         cursor = db.cursor()
+        # PostgreSQLではプレースホルダが %s
         cursor.execute(
             'INSERT INTO scores (timestamp, score, time) VALUES (%s, %s, %s)',
             (timestamp, score, time)
@@ -111,10 +106,11 @@ def save_score():
         print(f"スコアの保存中にエラーが発生しました: {e}")
         return jsonify({"error": "Failed to save score"}), 500
 
+# --- アプリケーションの初期化処理 ---
+# このコードはGunicornでアプリが起動した時に一度だけ実行される
+with app.app_context():
+    init_db()
+
 # --- ローカル開発用の設定 ---
 if __name__ == '__main__':
-    with app.app_context():
-        if not os.path.exists('highscore.db'):
-            print("'highscore.db'が見つからないため、新規に作成します。")
-            init_db()
     app.run(debug=True)
